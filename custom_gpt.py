@@ -2,6 +2,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from transformers.activations import ACT2FN
 
 class Conv1D(nn.Module):
     """
@@ -17,18 +18,31 @@ class Conv1D(nn.Module):
     def __init__(self, nf, nx):
         super().__init__()
         self.nf = nf
+        self.nx = nx
         self.weight = nn.Parameter(torch.empty(nx, nf))
         self.bias = nn.Parameter(torch.zeros(nf))
         nn.init.normal_(self.weight, std=0.02)
 
-    def forward(self, x):
-        size_out = x.size()[:-1] + (self.nf,)
-        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
-        x = x.view(size_out)
-        return x
+    def forward(self, x, output_per_head=False):
+        if output_per_head:
+            n_heads = x.shape[1]
+            stack_sz = int(self.nx/n_heads)
+            x_out = torch.zeros(x.shape[0], n_heads, x.shape[2], self.nf).to(x.get_device())
+            for h_idx in range(n_heads):
+                pre_proj_vals = x[:, h_idx] # (batch, seq_length, head_features)
+                size_out = (x.shape[0], x.shape[2], self.nf)
+                selected_weights = self.weight[h_idx*stack_sz:(h_idx+1)*stack_sz]
+                tmp_out = torch.mm(pre_proj_vals.reshape(-1, pre_proj_vals.shape[2]), selected_weights)
+                x_out[:, h_idx] = tmp_out.view(size_out)
+            return x_out, self.bias #((batch, heads, seq_length, nf), nf)
+        else:
+            size_out = x.size()[:-1] + (self.nf,)
+            x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+            x_out = x.view(size_out)
+            return x_out
 
 class MyGPT2Attention(nn.Module):
-    def __init__(self, config, is_cross_attention=False, layer_idx=None):
+    def __init__(self, config, is_cross_attention=False, layer_idx=None, output_per_head=False):
         super().__init__()
         self.config = config
         max_positions = config.max_position_embeddings
@@ -72,14 +86,7 @@ class MyGPT2Attention(nn.Module):
 
         self.pruned_heads = set()
 
-        self.intermediate_vals = None
-
-    def capture_per_head(self, buffer_loc):
-        self.intermediate_vals = buffer_loc
-
-    def flush_intermediate_vals(self):
-        self.intermediate_vals.clear()
-
+        self.output_per_head = output_per_head
     
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -231,12 +238,6 @@ class MyGPT2Attention(nn.Module):
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
-
-
-        
-        if self.intermediate_vals: self.intermediate_vals.append(value)
-
-
         
         if layer_past is not None:
             past_key, past_value = layer_past
@@ -254,16 +255,13 @@ class MyGPT2Attention(nn.Module):
             attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
 
-        if self.intermediate_vals: self.intermediate_vals.append(attn_output)
-
-
-        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
-        attn_output = self.c_proj(attn_output)
-
-
-        if self.intermediate_vals: self.intermediate_vals.append(attn_output)
-
-        
+        if self.output_per_head:
+            attn_output, bias_term = self.c_proj(attn_output, self.output_per_head)
+            attn_output = torch.sum(attn_output, dim=1)
+            attn_output += bias_term
+        else:
+            attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
+            attn_output = self.c_proj(attn_output)
         
         attn_output = self.resid_dropout(attn_output)
 
@@ -272,3 +270,125 @@ class MyGPT2Attention(nn.Module):
             outputs += (attn_weights,)
 
         return outputs  # a, present, (attentions)
+    
+
+
+
+
+class SkipBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        hidden_states: Optional[Tuple[torch.FloatTensor]],
+        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+    ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
+        return hidden_states, 0
+    
+
+
+class GPT2MLP(nn.Module):
+    def __init__(self, intermediate_size, config):
+        super().__init__()
+        embed_dim = config.hidden_size
+        self.c_fc = Conv1D(intermediate_size, embed_dim)
+        self.c_proj = Conv1D(embed_dim, intermediate_size)
+        self.act = ACT2FN[config.activation_function]
+        self.dropout = nn.Dropout(config.resid_pdrop)
+
+    def forward(self, hidden_states: Optional[Tuple[torch.FloatTensor]]) -> torch.FloatTensor:
+        hidden_states = self.c_fc(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.c_proj(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        return hidden_states
+    
+
+
+class IdentityGPT2Block(nn.Module):
+    def __init__(self, config, layer_idx=None):
+        super().__init__()
+        hidden_size = config.hidden_size
+        inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
+        attention_class = MyGPT2Attention
+
+        self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        self.attn = attention_class(config=config, layer_idx=layer_idx)
+        self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+
+        if config.add_cross_attention:
+            self.crossattention = attention_class(config=config, is_cross_attention=True, layer_idx=layer_idx)
+            self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+
+        self.mlp = GPT2MLP(inner_dim, config)
+        self.ident = nn.Identity()
+
+    def forward(
+        self,
+        hidden_states: Optional[Tuple[torch.FloatTensor]],
+        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+    ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
+        residual = hidden_states
+        hidden_states = self.ln_1(hidden_states)
+        attn_outputs = self.attn(
+            hidden_states,
+            layer_past=layer_past,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+        )
+        attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
+        outputs = attn_outputs[1:]
+        # residual connection
+        hidden_states = attn_output + residual
+
+        if encoder_hidden_states is not None:
+            # add one self-attention block for cross-attention
+            if not hasattr(self, "crossattention"):
+                raise ValueError(
+                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with "
+                    "cross-attention layers by setting `config.add_cross_attention=True`"
+                )
+            residual = hidden_states
+            hidden_states = self.ln_cross_attn(hidden_states)
+            cross_attn_outputs = self.crossattention(
+                hidden_states,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                output_attentions=output_attentions,
+            )
+            attn_output = cross_attn_outputs[0]
+            # residual connection
+            hidden_states = residual + attn_output
+            outputs = outputs + cross_attn_outputs[2:]  # add cross attentions if we output attention weights
+
+        residual = hidden_states
+        hidden_states = self.ln_2(hidden_states)
+        feed_forward_hidden_states = self.mlp(hidden_states)
+        # residual connection
+        hidden_states = residual + feed_forward_hidden_states
+        
+        hidden_states = self.ident(hidden_states)
+
+        if use_cache:
+            outputs = (hidden_states,) + outputs
+        else:
+            outputs = (hidden_states,) + outputs[1:]
+
+        return outputs  # hidden_states, present, (attentions, cross_attentions)
